@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+
+import base64
+import click
+import getpass
+import json
+import lxml.etree
+import requests
+import subprocess
+import urllib
+import pyotp
+import os
+
+def check(r):
+    r.raise_for_status()
+    return r
+
+def extract_form(html):
+    form = lxml.etree.fromstring(html, lxml.etree.HTMLParser()).find('.//form')
+    return (form.attrib['action'],
+        {inp.attrib['name']: inp.attrib['value'] for inp in form.findall('input')})
+
+def prelogin(s, gateway):
+    r = check(s.post('https://{}/'.format(gateway), allow_redirects=True) )
+    u1 =  urllib.parse.urlparse( r.url ) 
+    saml_req_url = "{}://{}".format(u1.scheme, u1.netloc)
+
+    action, formInputs = extract_form( r.content )
+    u2 = urllib.parse.urlparse( formInputs['fromURI'] )
+    saml_req_path =  u2.path 
+    saml_req_query = u2.query
+
+    saml_req =  "{}{}?{}".format(saml_req_url, saml_req_path, saml_req_query ) 
+    #assert 'SAMLRequest' in saml_req_data
+    return saml_req
+
+def post_json(s, url, data):
+    r = check(s.post(url, data=json.dumps(data),
+        headers={'Content-Type': 'application/json'}))
+    return r.json()
+
+def okta_auth(s, domain, username, password, totpkey):
+    r = post_json(s, 'https://{}/api/v1/authn'.format(domain),
+        {'username': username, 'password': password})
+
+    if r['status'] == 'MFA_REQUIRED':
+        def priority(factor):
+            return {'push': 0}.get(factor['factorType'], 1)
+        for factor in sorted(r['_embedded']['factors'], key=priority):
+            if factor['factorType'] == 'push':
+                url = factor['_links']['verify']['href']
+                while True:
+                    r = post_json(s, url, {'stateToken': r['stateToken']})
+                    if r['status'] != 'MFA_CHALLENGE':
+                        break
+                    assert r['factorResult'] == 'WAITING'
+                break
+            if factor['factorType'] == 'sms':
+                url = factor['_links']['verify']['href']
+                r = post_json(s, url, {'stateToken': r['stateToken']})
+                assert r['status'] == 'MFA_CHALLENGE'
+                code = input('SMS code? ')
+                r = post_json(s, url, {'stateToken': r['stateToken'], 'passCode': code})
+                break
+            if factor['factorType'] == 'token:software:totp':
+                url = factor['_links']['verify']['href']
+                r = post_json(s, url, {'stateToken': r['stateToken']})
+                assert r['status'] == 'MFA_CHALLENGE'
+                if totpkey is not None:
+                    code = pyotp.TOTP(totpkey).now()
+                else: 
+                    code = input('Code for {} ({}): '.format(factor['provider'], factor['vendorName']) )
+                r = post_json(s, url, {'stateToken': r['stateToken'], 'passCode': code})
+                break
+        else:
+            assert False
+
+    assert r['status'] == 'SUCCESS'
+    return r['sessionToken']
+
+def okta_saml(s, saml_req_url, username, password, totpkey=None):
+    domain = urllib.parse.urlparse(saml_req_url).netloc
+
+    # Just to set DT cookie
+    check(s.get(saml_req_url))
+
+    token = okta_auth(s, domain, username, password, totpkey)
+
+    r = check(s.get('https://{}/login/sessionCookieRedirect'.format(domain),
+        params={'token': token, 'redirectUrl': saml_req_url}))
+    saml_resp_url, saml_resp_data = extract_form(r.content)
+    assert 'SAMLResponse' in saml_resp_data
+    return saml_resp_url, saml_resp_data
+
+def complete_saml(s, saml_resp_url, saml_resp_data):
+    u = urllib.parse.urlparse( saml_resp_url )
+
+    u_path = os.path.dirname( u.path )
+    baseUrl = "{}://{}{}".format( u.scheme, u.netloc, u_path )
+
+    r = check(s.post(saml_resp_url, data=saml_resp_data, allow_redirects=True))
+    if 'id="btnContinue"' in  str( r.content ):
+        action, formInputs = extract_form( r.content )
+        formInputs['btnContinue'] = "Continue the session"
+        r2 = check(s.post( "{}/{}".format( baseUrl, action) , data=formInputs, allow_redirects=True) )
+
+        session_cookies = s.cookies.get_dict() 
+
+    return session_cookies
+
+
+######
+# Main
+
+# Parameters
+@click.command()
+@click.argument('gateway')
+@click.argument('openconnect-args', nargs=-1)
+@click.option('--username')
+@click.option('--password')
+@click.option('--totpkey')
+
+def main(gateway, openconnect_args, username, password, totpkey=None):
+    if username is None:
+        username = input('Username: ')
+    if password is None:
+        password = getpass.getpass()
+
+    with requests.Session() as s:
+        saml_req_url = prelogin(s, gateway)
+        saml_resp_url, saml_resp_data = okta_saml(s, saml_req_url, username, password, totpkey)
+        session_cookies = complete_saml(s, saml_resp_url, saml_resp_data)
+
+    #print( 'openconnect --protocol=nc --cookie="DSID={}" {}'.format(session_cookies['DSID'], gateway ))
+    #exit(1)
+    with subprocess.Popen([ 'openconnect', 
+                            gateway, 
+                            '--protocol=nc', 
+                            '--force-dpd=5',
+                            '--cookie=DSID=' + session_cookies['DSID']
+                          ] +
+                            list(openconnect_args)
+                          , stdin=subprocess.PIPE) as p:
+        p.communicate()
+
+main()
+
+
